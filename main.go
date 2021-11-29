@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -29,7 +30,9 @@ var outputDir = kingpin.Flag("output-dir", "").Short('o').Default("./").String()
 var targetDir = kingpin.Flag("target-dir", "").Short('t').Required().String()
 
 // Google Drive APIアクセス用オブジェクトのシングルトンの保存場所
-var service *drive.Service
+var serviceInstance *drive.Service
+var once sync.Once
+var config *oauth2.Config
 
 // 親ディレクトリの情報を保持するように拡張した構造体
 type fileInfo struct {
@@ -49,13 +52,10 @@ func main() {
 	}
 
 	// jsonからコンフィグに変換
-	config, err := google.ConfigFromJSON(b, drive.DriveReadonlyScope)
+	config, err = google.ConfigFromJSON(b, drive.DriveReadonlyScope)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
-
-	// Google Derive APIにアクセスするため使用するサービスを生成します
-	service = getService(config)
 
 	// 指定したフォルダ配下から該当ファイルを検索
 	files := getFileList(*targetDir, *fileName)
@@ -101,7 +101,7 @@ func main() {
 // 指定されたフォルダIDを起点に指定されたファイル名に一致するものを再起的に検索します
 func getFileList(id string, name string) (files []fileInfo) {
 	q := fmt.Sprintf("'%s' in parents", id)
-	list, err := service.Files.List().Q(q).Do()
+	list, err := getServiceInstance().Files.List().Q(q).Do()
 	if err != nil {
 		log.Fatalf("getFileList: %v", err)
 	}
@@ -133,7 +133,7 @@ func getFileList(id string, name string) (files []fileInfo) {
 func downloadFile(id string) (res *http.Response, err error) {
 	ctx := context.Background()
 	for counter := 0; counter < 40; counter++ {
-		res, err = service.Files.Get(id).Context(ctx).Download()
+		res, err = getServiceInstance().Files.Get(id).Context(ctx).Download()
 
 		if err != nil {
 			log.Printf("\nError file=%s get file retry%d/40\n", id, counter)
@@ -144,14 +144,18 @@ func downloadFile(id string) (res *http.Response, err error) {
 	return res, err
 }
 
-func getService(config *oauth2.Config) *drive.Service {
-	tokenSource := config.TokenSource(oauth2.NoContext, token.GetToken(config))
-	httpClient := oauth2.NewClient(oauth2.NoContext, tokenSource)
-	s, err := drive.New(httpClient)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return s
+// returns singleton instance
+func getServiceInstance() *drive.Service {
+	once.Do(func() {
+		tokenSource := config.TokenSource(oauth2.NoContext, token.GetToken(config))
+		httpClient := oauth2.NewClient(oauth2.NoContext, tokenSource)
+		service, err := drive.New(httpClient)
+		if err != nil {
+			log.Fatal(err)
+		}
+		serviceInstance = service
+	})
+	return serviceInstance
 }
 
 // https://developers.google.com/drive/api/v3/mime-types
