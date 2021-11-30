@@ -2,22 +2,17 @@ package main
 
 import (
 	"fmt"
+	"google-drive-downloader/helper"
 	"io"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"strings"
-	"sync"
 
-	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/drive/v3"
 
-	"golang.org/x/net/context"
 	"gopkg.in/alecthomas/kingpin.v2"
-
-	"google-drive-downloader/token"
 )
 
 // 動作確認用コマンド
@@ -28,17 +23,6 @@ import (
 var fileName = kingpin.Flag("file-name", "").Short('f').Required().String()
 var outputDir = kingpin.Flag("output-dir", "").Short('o').Default("./").String()
 var targetDir = kingpin.Flag("target-dir", "").Short('t').Required().String()
-
-// Google Drive APIアクセス用オブジェクトのシングルトンの保存場所
-var serviceInstance *drive.Service
-var once sync.Once
-var config *oauth2.Config
-
-// 親ディレクトリの情報を保持するように拡張した構造体
-type fileInfo struct {
-	Parent string
-	File   *drive.File
-}
 
 func main() {
 	kingpin.Parse()
@@ -52,19 +36,25 @@ func main() {
 	}
 
 	// jsonからコンフィグに変換
-	config, err = google.ConfigFromJSON(b, drive.DriveReadonlyScope)
+	config, err := google.ConfigFromJSON(b, drive.DriveReadonlyScope)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
 
+	// GoogleDriveへのアクセスを補助する構造体を初期化
+	g, err := helper.NewGoogleDrive(config)
+	if err != nil {
+		log.Fatalf("Unable to init google drive client: %v", err)
+	}
+
 	// 指定したフォルダ配下から該当ファイルを検索
-	files := getFileList(*targetDir, *fileName)
+	files := g.GetFileList(*targetDir, *fileName)
 
 	// 該当ファイルが複数存在する場合
 	if len(files) > 1 {
 		log.Printf("%sと同名のファイルが%d個存在します。\n", *fileName, len(files))
 		for _, f := range files {
-			log.Printf("https://drive.google.com/drive/folders/%s\n", f.Parent)
+			log.Printf("https://helper.google.com/helper/folders/%s\n", f.Parent)
 		}
 		log.Println("いずれかのファイルをリネームして重複状態を解決してください。")
 		os.Exit(1)
@@ -80,9 +70,9 @@ func main() {
 		log.Fatalln("GoogleDrive固有のファイル種類だったためダウンロードを中断しました。")
 	}
 
-	res, err := downloadFile(files[0].File.Id)
+	res, err := g.Download(files[0].File.Id)
 	if err != nil {
-		log.Fatalf("downloadFile : %v", err)
+		log.Fatalf("Download: %v", err)
 	}
 
 	file, err := os.Create(fmt.Sprintf("%s/%s", *outputDir, *fileName))
@@ -96,66 +86,6 @@ func main() {
 		log.Fatalln(err)
 	}
 	log.Println("ダウンロードが完了しました。")
-}
-
-// 指定されたフォルダIDを起点に指定されたファイル名に一致するものを再起的に検索します
-func getFileList(id string, name string) (files []fileInfo) {
-	q := fmt.Sprintf("'%s' in parents", id)
-	list, err := getServiceInstance().Files.List().Q(q).Do()
-	if err != nil {
-		log.Fatalf("getFileList: %v", err)
-	}
-	for _, f := range list.Files {
-		if f != nil {
-			if f.Name == name {
-				files = append(files, fileInfo{Parent: id, File: f})
-			}
-			if f.MimeType == "application/vnd.google-apps.folder" {
-				files = append(files, getFileList(f.Id, name)...)
-			}
-		}
-	}
-
-	// 同一フォルダに同名ファイルが存在する可能性があるため重複する情報を削除する
-	// フォルダIDをkey、重複判定をvalueとしてrangeで回した時
-	// 重複判定が初期値のfalseであればフラグを立てユニークな情報のみスライスに詰める
-	m := make(map[string]bool)
-	var uniq []fileInfo
-	for _, f := range files {
-		if m[f.Parent] == false {
-			m[f.Parent] = true
-			uniq = append(uniq, f)
-		}
-	}
-	return uniq
-}
-
-func downloadFile(id string) (res *http.Response, err error) {
-	ctx := context.Background()
-	for counter := 0; counter < 40; counter++ {
-		res, err = getServiceInstance().Files.Get(id).Context(ctx).Download()
-
-		if err != nil {
-			log.Printf("\nError file=%s get file retry%d/40\n", id, counter)
-			continue
-		}
-		break
-	}
-	return res, err
-}
-
-// returns singleton instance
-func getServiceInstance() *drive.Service {
-	once.Do(func() {
-		tokenSource := config.TokenSource(oauth2.NoContext, token.GetToken(config))
-		httpClient := oauth2.NewClient(oauth2.NoContext, tokenSource)
-		service, err := drive.New(httpClient)
-		if err != nil {
-			log.Fatal(err)
-		}
-		serviceInstance = service
-	})
-	return serviceInstance
 }
 
 // https://developers.google.com/drive/api/v3/mime-types
